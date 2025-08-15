@@ -212,6 +212,12 @@ export class ClaudeToOpenAITransformer implements Transformer {
           case 'tool_use':
             const toolUseBlock = item as ToolUseBlockParam
             
+            // 验证工具名称是否存在
+            if (!toolUseBlock.name || typeof toolUseBlock.name !== 'string') {
+              console.warn('Tool use block missing or invalid name:', toolUseBlock)
+              break
+            }
+            
             toolCalls.push({
               id: toolUseBlock.id, // 直接使用 Claude ID
               type: 'function' as const,
@@ -398,21 +404,27 @@ export class ClaudeToOpenAITransformer implements Transformer {
                     arguments: ''
                   })
                   
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
-                    type: 'content_block_start',
-                    index: contentIndex + 1 + index,
-                    content_block: {
-                      type: 'tool_use',
-                      id: toolCall.id || `tool_${index}`,
-                      name: '',
-                      input: {}
-                    }
-                  })))
+                  // 只有在有工具名称时才发送工具调用开始事件
+                  // 这里先不发送，等收到名称后再发送
                 }
 
                 const currentToolCall = currentToolCalls.get(index)!
                 
                 if (toolCall.function?.name) {
+                  // 如果这是第一次收到名称，发送工具调用开始事件
+                  if (!currentToolCall.name) {
+                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
+                      type: 'content_block_start',
+                      index: contentIndex + 1 + index,
+                      content_block: {
+                        type: 'tool_use',
+                        id: currentToolCall.id,
+                        name: toolCall.function.name,
+                        input: {}
+                      }
+                    })))
+                  }
+                  
                   currentToolCall.name = toolCall.function.name
                 }
                 
@@ -441,8 +453,14 @@ export class ClaudeToOpenAITransformer implements Transformer {
                 })))
               }
 
-              // 结束工具调用 - 在结束前修复累积的参数
+              // 结束工具调用 - 在结束前修复累积的参数并验证完整性
               for (const [index, toolCallData] of currentToolCalls) {
+                // 验证工具调用的完整性
+                if (!toolCallData.name || typeof toolCallData.name !== 'string') {
+                  console.warn('Skipping tool call with missing or invalid name:', toolCallData)
+                  continue
+                }
+                
                 // 修复累积的工具调用参数
                 if (toolCallData.arguments) {
                   try {
