@@ -432,20 +432,51 @@ export class ClaudeToOpenAITransformer implements Transformer {
                   const originalFragment = toolCall.function.arguments
                   const previousArgs = currentToolCall.arguments
                   
-                  // 使用新的流式修复函数
-                  const fixedFragment = fixStreamingToolArgument(originalFragment, previousArgs)
-                  
-                  // 更新累积的参数
-                  currentToolCall.arguments += originalFragment
-                  
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                    type: 'content_block_delta',
-                    index: contentIndex + 1 + index,
-                    delta: {
-                      type: 'input_json_delta',
-                      partial_json: fixedFragment
+                  try {
+                    // 使用新的流式修复函数
+                    const fixedFragment = fixStreamingToolArgument(originalFragment, previousArgs)
+                    
+                    // 更新累积的参数
+                    currentToolCall.arguments += originalFragment
+                    
+                    // 验证修复后的片段是否有效
+                    let fragmentToSend = fixedFragment
+                    
+                    // 额外验证：如果修复后的片段看起来不正确，使用备用方法
+                    if (fixedFragment !== originalFragment && originalFragment.includes("'")) {
+                      // 记录修复操作
+                      console.log('修复工具参数片段:', { original: originalFragment, fixed: fixedFragment })
                     }
-                  })))
+                    
+                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                      type: 'content_block_delta',
+                      index: contentIndex + 1 + index,
+                      delta: {
+                        type: 'input_json_delta',
+                        partial_json: fragmentToSend
+                      }
+                    })))
+                  } catch (error) {
+                    console.error('流式工具参数处理失败:', { 
+                      toolName: currentToolCall.name,
+                      fragment: originalFragment,
+                      error 
+                    })
+                    
+                    // 更新累积的参数（即使出错也要保持状态）
+                    currentToolCall.arguments += originalFragment
+                    
+                    // 尝试发送安全的片段（移除危险字符）
+                    const safeFragment = originalFragment.replace(/'/g, '"')
+                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                      type: 'content_block_delta',
+                      index: contentIndex + 1 + index,
+                      delta: {
+                        type: 'input_json_delta',
+                        partial_json: safeFragment
+                      }
+                    })))
+                  }
                 }
               }
             }
@@ -464,7 +495,12 @@ export class ClaudeToOpenAITransformer implements Transformer {
               for (const [index, toolCallData] of currentToolCalls) {
                 // 验证工具调用的完整性
                 if (!toolCallData.name || typeof toolCallData.name !== 'string') {
-                  console.warn('Skipping tool call with missing or invalid name:', toolCallData)
+                  console.warn('跳过缺少名称的工具调用:', toolCallData)
+                  // 发送一个错误的工具调用结束事件
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: contentIndex + 1 + index
+                  })))
                   continue
                 }
                 
@@ -474,20 +510,46 @@ export class ClaudeToOpenAITransformer implements Transformer {
                     // 尝试解析并修复参数格式
                     const fixedInput = fixToolCallArguments(toolCallData.arguments)
                     
-                    // 发送修复后的完整参数（如果之前的增量有格式问题）
-                    if (Object.keys(fixedInput).length > 0) {
+                    // 验证修复结果是否有效
+                    if (typeof fixedInput === 'object' && fixedInput !== null) {
+                      // 发送修复后的完整参数作为最终确认
+                      const finalArgsJson = JSON.stringify(fixedInput)
+                      
                       controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
                         type: 'content_block_delta', 
                         index: contentIndex + 1 + index,
                         delta: {
                           type: 'input_json_delta',
-                          partial_json: JSON.stringify(fixedInput)
+                          partial_json: finalArgsJson
+                        }
+                      })))
+                    } else {
+                      console.warn('工具调用参数修复后仍无效:', toolCallData.arguments)
+                      // 发送空对象作为回退
+                      controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                        type: 'content_block_delta', 
+                        index: contentIndex + 1 + index,
+                        delta: {
+                          type: 'input_json_delta',
+                          partial_json: '{}'
                         }
                       })))
                     }
                   } catch (error) {
-                    // 如果修复失败，记录错误但不中断流程
-                    console.warn('Failed to fix tool call arguments:', toolCallData.arguments, error)
+                    console.error('工具调用参数修复失败:', { 
+                      toolName: toolCallData.name,
+                      arguments: toolCallData.arguments, 
+                      error 
+                    })
+                    // 发送空对象作为最终回退
+                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                      type: 'content_block_delta', 
+                      index: contentIndex + 1 + index,
+                      delta: {
+                        type: 'input_json_delta',
+                        partial_json: '{}'
+                      }
+                    })))
                   }
                 }
                 

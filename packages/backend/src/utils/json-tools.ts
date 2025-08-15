@@ -32,23 +32,24 @@ export function fixSingleQuoteJson(jsonStr: string): string {
   }
 
   try {
-    // 使用正则表达式修复常见的单引号问题
-    // 1. 将属性名的单引号替换为双引号
-    // 2. 将字符串值的单引号替换为双引号
-    // 3. 处理转义字符
+    // 使用更强大的正则表达式修复常见的单引号问题
     
     // 先处理已经转义的单引号，避免重复处理
     fixed = fixed.replace(/\\'/g, '\u0001') // 临时标记已转义的单引号
     
-    // 匹配属性名: 'key' -> "key"
+    // 修复各种单引号情况
+    // 1. 属性名: 'key' -> "key"
     fixed = fixed.replace(/(\s*)'([^']*)'(\s*):/g, '$1"$2"$3:')
     
-    // 匹配字符串值: :'value' -> :"value" (考虑嵌套引号的情况)
+    // 2. 字符串值: :'value' -> :"value"
     fixed = fixed.replace(/:(\s*)'([^']*)'/g, ':$1"$2"')
     
-    // 匹配数组中的字符串: ['value'] -> ["value"]
+    // 3. 数组中的字符串: ['value'] -> ["value"]
     fixed = fixed.replace(/\[(\s*)'([^']*)'/g, '[$1"$2"')
     fixed = fixed.replace(/,(\s*)'([^']*)'/g, ',$1"$2"')
+    
+    // 4. 处理更复杂的嵌套情况
+    fixed = fixed.replace(/\{(\s*)'([^']*)'/g, '{$1"$2"')
     
     // 恢复已转义的单引号为转义的双引号
     fixed = fixed.replace(/\u0001/g, '\\"')
@@ -59,19 +60,22 @@ export function fixSingleQuoteJson(jsonStr: string): string {
   } catch (error) {
     // 如果修复失败，尝试更激进的修复方法
     try {
-      // 最后手段：尝试eval方法（仅用于对象字面量）
+      // 最后手段：尝试全局替换（但要小心字符串内容）
       if (fixed.startsWith('{') && fixed.endsWith('}')) {
-        // 将单引号属性名和值都替换为双引号
-        let evalFix = fixed
-        // 替换所有单引号为双引号，但要小心字符串内容
-        evalFix = evalFix.replace(/'/g, '"')
-        JSON.parse(evalFix)
-        return evalFix
+        let aggressiveFix = fixed
+        // 将所有单引号替换为双引号
+        aggressiveFix = aggressiveFix.replace(/'/g, '"')
+        
+        // 尝试解析
+        JSON.parse(aggressiveFix)
+        return aggressiveFix
       }
     } catch {
-      // 最后都失败了，返回原始字符串
+      // 最激进的方法也失败了
     }
     
+    // 如果所有修复都失败，返回原始字符串
+    console.warn('JSON修复失败，返回原始字符串:', jsonStr)
     return jsonStr
   }
 }
@@ -93,10 +97,14 @@ export function safeParseJson<T = any>(jsonStr: string, defaultValue: T = {} as 
   } catch {
     try {
       const fixed = fixSingleQuoteJson(jsonStr)
-      return JSON.parse(fixed)
+      // 只有在实际修复了内容时才尝试解析
+      if (fixed !== jsonStr) {
+        return JSON.parse(fixed)
+      }
     } catch {
-      return defaultValue
+      // 修复解析失败，使用默认值
     }
+    return defaultValue
   }
 }
 
@@ -113,7 +121,7 @@ export function fixToolCallArguments(argsStr: string): Record<string, any> {
 
 /**
  * 修复流式工具调用参数片段
- * 处理流式输出中的单引号JSON片段
+ * 处理流式输出中的单引号JSON片段，提供强大的回退机制
  * 
  * @param fragment 参数片段字符串
  * @param accumulated 已累积的参数字符串
@@ -124,16 +132,36 @@ export function fixStreamingToolArgument(fragment: string, accumulated: string =
     return fragment
   }
 
-  // 如果片段包含单引号，进行修复
-  if (fragment.includes("'")) {
-    // 简单的单引号替换
-    let fixed = fragment.replace(/'/g, '"')
-    
-    // 特殊情况：处理已转义的双引号（原本是转义的单引号）
-    fixed = fixed.replace(/\\"/g, "\\'")
-    
-    return fixed
-  }
+  try {
+    // 首先检查是否需要修复（只有包含单引号的才修复）
+    if (fragment.includes("'")) {
+      let fixed = fragment.replace(/'/g, '"')
+      // 处理已转义的双引号（原本是转义的单引号）
+      fixed = fixed.replace(/\\"/g, "\\'")
+      return fixed
+    }
 
-  return fragment
+    // 如果没有单引号，检查是否是JSON片段
+    if (accumulated) {
+      const testStr = accumulated + fragment
+      try {
+        // 如果累积的字符串可以解析为JSON，说明片段是正确的
+        JSON.parse(testStr)
+        return fragment
+      } catch {
+        // 如果不能解析，尝试修复累积的字符串
+        const fixedAccumulated = fixSingleQuoteJson(testStr)
+        if (fixedAccumulated !== testStr) {
+          // 如果修复成功，计算修复后的片段
+          const newFragment = fixedAccumulated.slice(accumulated.length)
+          return newFragment || fragment
+        }
+      }
+    }
+
+    return fragment
+  } catch (error) {
+    console.warn('流式工具参数修复失败:', { fragment, accumulated, error })
+    return fragment
+  }
 }
