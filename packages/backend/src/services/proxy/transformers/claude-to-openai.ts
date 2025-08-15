@@ -25,7 +25,7 @@ import type {
   ChatCompletionToolChoiceOption,
   ChatCompletion
 } from 'openai/resources/chat/completions'
-import { fixToolCallArguments } from '../../../utils/json-tools'
+import { fixToolCallArguments, fixSingleQuoteJson, fixStreamingToolArgument } from '../../../utils/json-tools'
 
 export class ClaudeToOpenAITransformer implements Transformer {
   private client: OpenAI | null = null
@@ -429,14 +429,21 @@ export class ClaudeToOpenAITransformer implements Transformer {
                 }
                 
                 if (toolCall.function?.arguments) {
-                  currentToolCall.arguments += toolCall.function.arguments
+                  const originalFragment = toolCall.function.arguments
+                  const previousArgs = currentToolCall.arguments
+                  
+                  // 使用新的流式修复函数
+                  const fixedFragment = fixStreamingToolArgument(originalFragment, previousArgs)
+                  
+                  // 更新累积的参数
+                  currentToolCall.arguments += originalFragment
                   
                   controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
                     type: 'content_block_delta',
                     index: contentIndex + 1 + index,
                     delta: {
                       type: 'input_json_delta',
-                      partial_json: toolCall.function.arguments
+                      partial_json: fixedFragment
                     }
                   })))
                 }

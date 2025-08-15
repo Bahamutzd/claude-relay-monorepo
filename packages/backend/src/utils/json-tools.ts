@@ -110,3 +110,30 @@ export function safeParseJson<T = any>(jsonStr: string, defaultValue: T = {} as 
 export function fixToolCallArguments(argsStr: string): Record<string, any> {
   return safeParseJson(argsStr, {})
 }
+
+/**
+ * 修复流式工具调用参数片段
+ * 处理流式输出中的单引号JSON片段
+ * 
+ * @param fragment 参数片段字符串
+ * @param accumulated 已累积的参数字符串
+ * @returns 修复后的片段字符串
+ */
+export function fixStreamingToolArgument(fragment: string, accumulated: string = ''): string {
+  if (!fragment || typeof fragment !== 'string') {
+    return fragment
+  }
+
+  // 如果片段包含单引号，进行修复
+  if (fragment.includes("'")) {
+    // 简单的单引号替换
+    let fixed = fragment.replace(/'/g, '"')
+    
+    // 特殊情况：处理已转义的双引号（原本是转义的单引号）
+    fixed = fixed.replace(/\\"/g, "\\'")
+    
+    return fixed
+  }
+
+  return fragment
+}

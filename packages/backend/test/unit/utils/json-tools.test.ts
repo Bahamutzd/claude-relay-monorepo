@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { fixSingleQuoteJson, safeParseJson, fixToolCallArguments } from '../../../src/utils/json-tools'
+import { fixSingleQuoteJson, safeParseJson, fixToolCallArguments, fixStreamingToolArgument } from '../../../src/utils/json-tools'
 
 describe('JSON修复工具', () => {
   describe('fixSingleQuoteJson', () => {
@@ -110,6 +110,71 @@ describe('JSON修复工具', () => {
       const input = ""
       const result = fixToolCallArguments(input)
       expect(result).toEqual({})
+    })
+  })
+
+  describe('fixStreamingToolArgument', () => {
+    it('应该修复流式片段中的单引号', () => {
+      const fragment = "{'key': 'value'}"
+      const result = fixStreamingToolArgument(fragment)
+      expect(result).toBe('{"key": "value"}')
+    })
+
+    it('应该处理累积参数的修复', () => {
+      const accumulated = "{'name': 'test'"
+      const fragment = ", 'age': 25}"
+      const result = fixStreamingToolArgument(fragment, accumulated)
+      // 应该能识别并修复完整的参数
+      expect(result).toContain('"')
+    })
+
+    it('应该保持正确格式的片段不变', () => {
+      const fragment = '{"key": "value"}'
+      const result = fixStreamingToolArgument(fragment)
+      expect(result).toBe(fragment) // 没有单引号，应该保持不变
+    })
+
+    it('应该处理部分片段', () => {
+      const fragment = "'command': 'ls -la'"
+      const result = fixStreamingToolArgument(fragment)
+      expect(result).toBe('"command": "ls -la"')
+    })
+
+    it('应该处理空片段', () => {
+      const fragment = ''
+      const result = fixStreamingToolArgument(fragment)
+      expect(result).toBe('')
+    })
+
+    it('应该处理非JSON字符串片段', () => {
+      const fragment = 'not json'
+      const result = fixStreamingToolArgument(fragment)
+      expect(result).toBe('not json')
+    })
+
+    it('应该处理流式工具调用场景', () => {
+      // 模拟流式接收工具调用参数的过程
+      const fragments = [
+        "{'function':",
+        " 'analyze_code',",
+        " 'params': {",
+        "'file': 'main.py'",
+        "}}"
+      ]
+      
+      let accumulated = ''
+      const results = []
+      
+      for (const fragment of fragments) {
+        const fixed = fixStreamingToolArgument(fragment, accumulated)
+        results.push(fixed)
+        accumulated += fragment
+      }
+      
+      // 至少应该修复单引号问题
+      const finalResult = results.join('')
+      expect(finalResult).toContain('"function"')
+      expect(finalResult).toContain('"analyze_code"')
     })
   })
 
