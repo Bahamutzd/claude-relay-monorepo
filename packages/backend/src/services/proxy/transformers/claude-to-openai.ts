@@ -483,6 +483,7 @@ export class ClaudeToOpenAITransformer implements Transformer {
 
   /**
    * 将Claude响应作为流式事件输出
+   * 注意：即使在工具调用模式下，我们仍然需要产生流式事件格式，但内容是一次性完整输出的
    */
   private outputClaudeMessageAsStream(
     claudeMessage: Message, 
@@ -501,19 +502,34 @@ export class ClaudeToOpenAITransformer implements Transformer {
       // 处理所有内容块
       for (const contentBlock of claudeMessage.content) {
         if (contentBlock.type === 'text') {
-          // 文本块
+          // 文本块 - 分块输出以模拟流式效果，避免 Streaming fallback triggered
           controller.enqueue(encoder.encode(this.createSSEEvent('content_block_start', {
             type: 'content_block_start',
             index: contentIndex,
             content_block: contentBlock
           })))
 
-          // 发送完整文本
-          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
-            type: 'content_block_delta',
-            index: contentIndex,
-            delta: { type: 'text_delta', text: contentBlock.text }
-          })))
+          // 将文本分块输出，模拟流式体验
+          const text = contentBlock.text
+          const chunkSize = 20 // 每次发送20个字符
+          if (text.length <= chunkSize) {
+            // 短文本一次性输出
+            controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
+              type: 'content_block_delta',
+              index: contentIndex,
+              delta: { type: 'text_delta', text: text }
+            })))
+          } else {
+            // 长文本分块输出
+            for (let i = 0; i < text.length; i += chunkSize) {
+              const chunk = text.slice(i, i + chunkSize)
+              controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: contentIndex,
+                delta: { type: 'text_delta', text: chunk }
+              })))
+            }
+          }
 
           controller.enqueue(encoder.encode(this.createSSEEvent('content_block_stop', {
             type: 'content_block_stop',
@@ -521,14 +537,14 @@ export class ClaudeToOpenAITransformer implements Transformer {
           })))
 
         } else if (contentBlock.type === 'tool_use') {
-          // 工具使用块
+          // 工具使用块 - 一次性输出完整的工具调用信息
           controller.enqueue(encoder.encode(this.createSSEEvent('content_block_start', {
             type: 'content_block_start',
             index: contentIndex,
             content_block: contentBlock
           })))
 
-          // 发送完整的工具参数（已修复）
+          // 发送完整的工具参数（已修复），一次性输出
           const inputJson = JSON.stringify(contentBlock.input || {})
           controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
             type: 'content_block_delta',
