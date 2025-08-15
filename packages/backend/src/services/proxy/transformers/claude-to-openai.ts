@@ -25,6 +25,7 @@ import type {
   ChatCompletionToolChoiceOption,
   ChatCompletion
 } from 'openai/resources/chat/completions'
+import { fixToolCallArguments } from '../../../utils/json-tools'
 
 export class ClaudeToOpenAITransformer implements Transformer {
   private client: OpenAI | null = null
@@ -306,7 +307,7 @@ export class ClaudeToOpenAITransformer implements Transformer {
           type: 'tool_use',
           id: toolCall.id, // 直接使用 OpenAI ID
           name: toolCall.function.name,
-          input: JSON.parse(toolCall.function.arguments || '{}')
+          input: fixToolCallArguments(toolCall.function.arguments || '{}')
         })
       }
     }
@@ -440,8 +441,31 @@ export class ClaudeToOpenAITransformer implements Transformer {
                 })))
               }
 
-              // 结束工具调用
-              for (const [index] of currentToolCalls) {
+              // 结束工具调用 - 在结束前修复累积的参数
+              for (const [index, toolCallData] of currentToolCalls) {
+                // 修复累积的工具调用参数
+                if (toolCallData.arguments) {
+                  try {
+                    // 尝试解析并修复参数格式
+                    const fixedInput = fixToolCallArguments(toolCallData.arguments)
+                    
+                    // 发送修复后的完整参数（如果之前的增量有格式问题）
+                    if (Object.keys(fixedInput).length > 0) {
+                      controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                        type: 'content_block_delta', 
+                        index: contentIndex + 1 + index,
+                        delta: {
+                          type: 'input_json_delta',
+                          partial_json: JSON.stringify(fixedInput)
+                        }
+                      })))
+                    }
+                  } catch (error) {
+                    // 如果修复失败，记录错误但不中断流程
+                    console.warn('Failed to fix tool call arguments:', toolCallData.arguments, error)
+                  }
+                }
+                
                 controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
                   type: 'content_block_stop',
                   index: contentIndex + 1 + index
