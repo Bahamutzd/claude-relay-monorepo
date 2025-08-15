@@ -372,7 +372,7 @@ export class ClaudeToOpenAITransformer implements Transformer {
             const choice = chunk.choices[0]
             if (!choice) continue
 
-            // 处理文本内容
+            // 处理文本内容 - 正常流式输出
             if (choice.delta.content) {
               // 如果是第一次收到内容，发送 content_block_start
               if (contentIndex === 0) {
@@ -383,7 +383,7 @@ export class ClaudeToOpenAITransformer implements Transformer {
                 })))
               }
 
-              // 发送内容增量
+              // 发送内容增量 - 立即输出
               controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
                 type: 'content_block_delta',
                 index: contentIndex,
@@ -391,99 +391,57 @@ export class ClaudeToOpenAITransformer implements Transformer {
               })))
             }
 
-            // 处理工具调用
+            // 处理工具调用 - 缓存模式，不立即输出
             if (choice.delta.tool_calls) {
               for (const toolCall of choice.delta.tool_calls) {
                 const index = toolCall.index || 0
                 
                 if (!currentToolCalls.has(index)) {
-                  // 开始新的工具调用
+                  // 开始新的工具调用，但不发送开始事件
                   currentToolCalls.set(index, {
                     id: toolCall.id || `tool_${index}`,
                     name: '',
-                    arguments: ''
+                    arguments: '',
+                    // 缓存相关字段
+                    isComplete: false,
+                    bufferedEvents: [] // 缓存所有应该发送的事件
                   })
-                  
-                  // 只有在有工具名称时才发送工具调用开始事件
-                  // 这里先不发送，等收到名称后再发送
                 }
 
                 const currentToolCall = currentToolCalls.get(index)!
                 
+                // 缓存工具名称
                 if (toolCall.function?.name) {
-                  // 如果这是第一次收到名称，发送工具调用开始事件
                   if (!currentToolCall.name) {
-                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
+                    currentToolCall.name = toolCall.function.name
+                    // 缓存开始事件，不立即发送
+                    currentToolCall.bufferedEvents.push({
                       type: 'content_block_start',
-                      index: contentIndex + 1 + index,
-                      content_block: {
-                        type: 'tool_use',
-                        id: currentToolCall.id,
-                        name: toolCall.function.name,
-                        input: {}
+                      data: {
+                        type: 'content_block_start',
+                        index: contentIndex + 1 + index,
+                        content_block: {
+                          type: 'tool_use',
+                          id: currentToolCall.id,
+                          name: toolCall.function.name,
+                          input: {}
+                        }
                       }
-                    })))
+                    })
                   }
-                  
-                  currentToolCall.name = toolCall.function.name
                 }
                 
+                // 缓存参数片段，不立即发送
                 if (toolCall.function?.arguments) {
-                  const originalFragment = toolCall.function.arguments
-                  const previousArgs = currentToolCall.arguments
-                  
-                  try {
-                    // 使用新的流式修复函数
-                    const fixedFragment = fixStreamingToolArgument(originalFragment, previousArgs)
-                    
-                    // 更新累积的参数
-                    currentToolCall.arguments += originalFragment
-                    
-                    // 验证修复后的片段是否有效
-                    let fragmentToSend = fixedFragment
-                    
-                    // 额外验证：如果修复后的片段看起来不正确，使用备用方法
-                    if (fixedFragment !== originalFragment && originalFragment.includes("'")) {
-                      // 记录修复操作
-                      console.log('修复工具参数片段:', { original: originalFragment, fixed: fixedFragment })
-                    }
-                    
-                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                      type: 'content_block_delta',
-                      index: contentIndex + 1 + index,
-                      delta: {
-                        type: 'input_json_delta',
-                        partial_json: fragmentToSend
-                      }
-                    })))
-                  } catch (error) {
-                    console.error('流式工具参数处理失败:', { 
-                      toolName: currentToolCall.name,
-                      fragment: originalFragment,
-                      error 
-                    })
-                    
-                    // 更新累积的参数（即使出错也要保持状态）
-                    currentToolCall.arguments += originalFragment
-                    
-                    // 尝试发送安全的片段（移除危险字符）
-                    const safeFragment = originalFragment.replace(/'/g, '"')
-                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                      type: 'content_block_delta',
-                      index: contentIndex + 1 + index,
-                      delta: {
-                        type: 'input_json_delta',
-                        partial_json: safeFragment
-                      }
-                    })))
-                  }
+                  currentToolCall.arguments += toolCall.function.arguments
+                  // 不发送 content_block_delta 事件，而是缓存
                 }
               }
             }
 
             // 处理完成
             if (choice.finish_reason) {
-              // 结束所有内容块
+              // 结束文本内容块
               if (choice.delta.content) {
                 controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
                   type: 'content_block_stop',
@@ -491,72 +449,86 @@ export class ClaudeToOpenAITransformer implements Transformer {
                 })))
               }
 
-              // 结束工具调用 - 在结束前修复累积的参数并验证完整性
+              // 处理所有缓存的工具调用 - 一次性修复并输出
               for (const [index, toolCallData] of currentToolCalls) {
-                // 验证工具调用的完整性
-                if (!toolCallData.name || typeof toolCallData.name !== 'string') {
-                  console.warn('跳过缺少名称的工具调用:', toolCallData)
-                  // 发送一个错误的工具调用结束事件
+                try {
+                  // 验证工具调用的完整性
+                  if (!toolCallData.name || typeof toolCallData.name !== 'string') {
+                    console.warn('跳过缺少名称的工具调用:', toolCallData)
+                    continue
+                  }
+                  
+                  // 修复完整的工具调用参数
+                  let fixedInput = {}
+                  if (toolCallData.arguments) {
+                    fixedInput = fixToolCallArguments(toolCallData.arguments)
+                    console.log('修复工具调用参数:', { 
+                      original: toolCallData.arguments, 
+                      fixed: fixedInput 
+                    })
+                  }
+
+                  // 发送工具调用开始事件
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: contentIndex + 1 + index,
+                    content_block: {
+                      type: 'tool_use',
+                      id: toolCallData.id,
+                      name: toolCallData.name,
+                      input: fixedInput
+                    }
+                  })))
+
+                  // 发送完整的修复后参数作为一个完整的JSON
+                  const completeJson = JSON.stringify(fixedInput)
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: contentIndex + 1 + index,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: completeJson
+                    }
+                  })))
+
+                  // 发送工具调用结束事件
                   controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
                     type: 'content_block_stop',
                     index: contentIndex + 1 + index
                   })))
-                  continue
-                }
-                
-                // 修复累积的工具调用参数
-                if (toolCallData.arguments) {
-                  try {
-                    // 尝试解析并修复参数格式
-                    const fixedInput = fixToolCallArguments(toolCallData.arguments)
-                    
-                    // 验证修复结果是否有效
-                    if (typeof fixedInput === 'object' && fixedInput !== null) {
-                      // 发送修复后的完整参数作为最终确认
-                      const finalArgsJson = JSON.stringify(fixedInput)
-                      
-                      controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                        type: 'content_block_delta', 
-                        index: contentIndex + 1 + index,
-                        delta: {
-                          type: 'input_json_delta',
-                          partial_json: finalArgsJson
-                        }
-                      })))
-                    } else {
-                      console.warn('工具调用参数修复后仍无效:', toolCallData.arguments)
-                      // 发送空对象作为回退
-                      controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                        type: 'content_block_delta', 
-                        index: contentIndex + 1 + index,
-                        delta: {
-                          type: 'input_json_delta',
-                          partial_json: '{}'
-                        }
-                      })))
+
+                } catch (error) {
+                  console.error('工具调用处理失败:', { 
+                    toolName: toolCallData.name,
+                    arguments: toolCallData.arguments, 
+                    error 
+                  })
+                  // 即使出错，也要发送一个空的工具调用
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: contentIndex + 1 + index,
+                    content_block: {
+                      type: 'tool_use',
+                      id: toolCallData.id,
+                      name: toolCallData.name || 'unknown',
+                      input: {}
                     }
-                  } catch (error) {
-                    console.error('工具调用参数修复失败:', { 
-                      toolName: toolCallData.name,
-                      arguments: toolCallData.arguments, 
-                      error 
-                    })
-                    // 发送空对象作为最终回退
-                    controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                      type: 'content_block_delta', 
-                      index: contentIndex + 1 + index,
-                      delta: {
-                        type: 'input_json_delta',
-                        partial_json: '{}'
-                      }
-                    })))
-                  }
+                  })))
+                  
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: contentIndex + 1 + index,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: '{}'
+                    }
+                  })))
+
+                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: contentIndex + 1 + index
+                  })))
                 }
-                
-                controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: contentIndex + 1 + index
-                })))
               }
 
               // 发送消息完成
