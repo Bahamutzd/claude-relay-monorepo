@@ -339,221 +339,357 @@ export class ClaudeToOpenAITransformer implements Transformer {
 
   /**
    * 转换流式响应为 Claude 格式
+   * 混合模式：检测到工具调用时切换为非流式处理，避免流式/非流式混合导致的问题
    */
   private async transformStreamResponse(openaiStream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>): Promise<ReadableStream> {
     const encoder = new TextEncoder()
     const self = this
-    let messageStarted = false
-    let contentIndex = 0
-    let currentToolCalls: Map<number, any> = new Map()
+    let hasToolCalls = false
+    let accumulatedChunks: OpenAI.Chat.Completions.ChatCompletionChunk[] = []
     
     return new ReadableStream({
       async start(controller) {
         try {
+          // 第一阶段：收集chunks并检测工具调用
           for await (const chunk of openaiStream) {
-            // 发送 message_start 事件
-            if (!messageStarted) {
-              controller.enqueue(encoder.encode(self.createSSEEvent('message_start', {
-                type: 'message_start',
-                message: {
-                  id: `msg_${Date.now()}`,
-                  type: 'message',
-                  role: 'assistant',
-                  model: chunk.model,
-                  content: [],
-                  stop_reason: null,
-                  stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0 }
-                }
-              })))
-              messageStarted = true
-            }
-
-            const choice = chunk.choices[0]
-            if (!choice) continue
-
-            // 处理文本内容 - 正常流式输出
-            if (choice.delta.content) {
-              // 如果是第一次收到内容，发送 content_block_start
-              if (contentIndex === 0) {
-                controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
-                  type: 'content_block_start',
-                  index: contentIndex,
-                  content_block: { type: 'text', text: '' }
-                })))
-              }
-
-              // 发送内容增量 - 立即输出
-              controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                type: 'content_block_delta',
-                index: contentIndex,
-                delta: { type: 'text_delta', text: choice.delta.content }
-              })))
-            }
-
-            // 处理工具调用 - 缓存模式，不立即输出
-            if (choice.delta.tool_calls) {
-              for (const toolCall of choice.delta.tool_calls) {
-                const index = toolCall.index || 0
-                
-                if (!currentToolCalls.has(index)) {
-                  // 开始新的工具调用，但不发送开始事件
-                  currentToolCalls.set(index, {
-                    id: toolCall.id || `tool_${index}`,
-                    name: '',
-                    arguments: '',
-                    // 缓存相关字段
-                    isComplete: false,
-                    bufferedEvents: [] // 缓存所有应该发送的事件
-                  })
-                }
-
-                const currentToolCall = currentToolCalls.get(index)!
-                
-                // 缓存工具名称
-                if (toolCall.function?.name) {
-                  if (!currentToolCall.name) {
-                    currentToolCall.name = toolCall.function.name
-                    // 缓存开始事件，不立即发送
-                    currentToolCall.bufferedEvents.push({
-                      type: 'content_block_start',
-                      data: {
-                        type: 'content_block_start',
-                        index: contentIndex + 1 + index,
-                        content_block: {
-                          type: 'tool_use',
-                          id: currentToolCall.id,
-                          name: toolCall.function.name,
-                          input: {}
-                        }
-                      }
-                    })
-                  }
-                }
-                
-                // 缓存参数片段，不立即发送
-                if (toolCall.function?.arguments) {
-                  currentToolCall.arguments += toolCall.function.arguments
-                  // 不发送 content_block_delta 事件，而是缓存
-                }
-              }
-            }
-
-            // 处理完成
-            if (choice.finish_reason) {
-              // 结束文本内容块
-              if (choice.delta.content) {
-                controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: contentIndex
-                })))
-              }
-
-              // 处理所有缓存的工具调用 - 一次性修复并输出
-              for (const [index, toolCallData] of currentToolCalls) {
-                try {
-                  // 验证工具调用的完整性
-                  if (!toolCallData.name || typeof toolCallData.name !== 'string') {
-                    console.warn('跳过缺少名称的工具调用:', toolCallData)
-                    continue
-                  }
-                  
-                  // 修复完整的工具调用参数
-                  let fixedInput = {}
-                  if (toolCallData.arguments) {
-                    fixedInput = fixToolCallArguments(toolCallData.arguments)
-                    console.log('修复工具调用参数:', { 
-                      original: toolCallData.arguments, 
-                      fixed: fixedInput 
-                    })
-                  }
-
-                  // 发送工具调用开始事件
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
-                    type: 'content_block_start',
-                    index: contentIndex + 1 + index,
-                    content_block: {
-                      type: 'tool_use',
-                      id: toolCallData.id,
-                      name: toolCallData.name,
-                      input: fixedInput
-                    }
-                  })))
-
-                  // 发送完整的修复后参数作为一个完整的JSON
-                  const completeJson = JSON.stringify(fixedInput)
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                    type: 'content_block_delta',
-                    index: contentIndex + 1 + index,
-                    delta: {
-                      type: 'input_json_delta',
-                      partial_json: completeJson
-                    }
-                  })))
-
-                  // 发送工具调用结束事件
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
-                    type: 'content_block_stop',
-                    index: contentIndex + 1 + index
-                  })))
-
-                } catch (error) {
-                  console.error('工具调用处理失败:', { 
-                    toolName: toolCallData.name,
-                    arguments: toolCallData.arguments, 
-                    error 
-                  })
-                  // 即使出错，也要发送一个空的工具调用
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_start', {
-                    type: 'content_block_start',
-                    index: contentIndex + 1 + index,
-                    content_block: {
-                      type: 'tool_use',
-                      id: toolCallData.id,
-                      name: toolCallData.name || 'unknown',
-                      input: {}
-                    }
-                  })))
-                  
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_delta', {
-                    type: 'content_block_delta',
-                    index: contentIndex + 1 + index,
-                    delta: {
-                      type: 'input_json_delta',
-                      partial_json: '{}'
-                    }
-                  })))
-
-                  controller.enqueue(encoder.encode(self.createSSEEvent('content_block_stop', {
-                    type: 'content_block_stop',
-                    index: contentIndex + 1 + index
-                  })))
-                }
-              }
-
-              // 发送消息完成
-              controller.enqueue(encoder.encode(self.createSSEEvent('message_delta', {
-                type: 'message_delta',
-                delta: {
-                  stop_reason: self.mapFinishReason(choice.finish_reason),
-                  stop_sequence: null
-                }
-              })))
+            accumulatedChunks.push(chunk)
+            
+            // 检测是否有工具调用
+            if (chunk.choices[0]?.delta?.tool_calls && !hasToolCalls) {
+              hasToolCalls = true
+              console.log('检测到工具调用，切换为非流式处理模式')
             }
           }
 
-          // 发送结束事件
-          controller.enqueue(encoder.encode(self.createSSEEvent('message_stop', {
-            type: 'message_stop'
-          })))
+          // 第二阶段：根据是否有工具调用选择处理策略
+          if (hasToolCalls) {
+            // 有工具调用：使用非流式处理逻辑
+            console.log('使用非流式模式处理工具调用')
+            
+            // 重构完整的ChatCompletion响应
+            const completeResponse = self.reconstructCompletionFromChunks(accumulatedChunks)
+            
+            // 使用现有的非流式转换逻辑（包含工具调用修复）
+            const claudeMessage = self.transformResponse(completeResponse)
+            
+            // 将Claude响应转换为流式事件输出
+            self.outputClaudeMessageAsStream(claudeMessage, controller, encoder)
+            
+          } else {
+            // 无工具调用：正常流式处理
+            console.log('无工具调用，使用正常流式模式')
+            self.outputChunksAsStream(accumulatedChunks, controller, encoder)
+          }
+
         } catch (error) {
-          controller.error(error)
+          console.error('流式处理发生错误:', error)
+          self.handleStreamError(error, controller, encoder)
         } finally {
           controller.close()
-          currentToolCalls.clear()
         }
       }
     })
+  }
+
+  /**
+   * 从chunks重构完整的ChatCompletion响应
+   */
+  private reconstructCompletionFromChunks(chunks: OpenAI.Chat.Completions.ChatCompletionChunk[]): ChatCompletion {
+    if (chunks.length === 0) {
+      throw new Error('没有chunks可以重构')
+    }
+
+    const firstChunk = chunks[0]
+    let content = ''
+    const toolCalls: any[] = []
+    const toolCallsMap: Map<number, any> = new Map()
+    let finishReason: string | null = null
+
+    // 合并所有chunks的内容
+    for (const chunk of chunks) {
+      const choice = chunk.choices[0]
+      if (!choice) continue
+
+      // 合并文本内容
+      if (choice.delta.content) {
+        content += choice.delta.content
+      }
+
+      // 合并工具调用
+      if (choice.delta.tool_calls) {
+        for (const toolCall of choice.delta.tool_calls) {
+          const index = toolCall.index || 0
+          
+          if (!toolCallsMap.has(index)) {
+            toolCallsMap.set(index, {
+              id: toolCall.id || `tool_${index}`,
+              type: 'function' as const,
+              function: {
+                name: '',
+                arguments: ''
+              }
+            })
+          }
+
+          const existingToolCall = toolCallsMap.get(index)!
+          
+          if (toolCall.function?.name) {
+            existingToolCall.function.name = toolCall.function.name
+          }
+          
+          if (toolCall.function?.arguments) {
+            existingToolCall.function.arguments += toolCall.function.arguments
+          }
+        }
+      }
+
+      // 记录完成原因
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason
+      }
+    }
+
+    // 转换工具调用映射为数组
+    for (const [index, toolCall] of toolCallsMap) {
+      toolCalls[index] = toolCall
+    }
+
+    // 构建完整响应
+    const completeResponse: ChatCompletion = {
+      id: `chatcmpl_${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: firstChunk.model,
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: content || null,
+          tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+          refusal: null
+        },
+        finish_reason: finishReason as any,
+        logprobs: null
+      }],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0
+      }
+    }
+
+    return completeResponse
+  }
+
+  /**
+   * 将Claude响应作为流式事件输出
+   */
+  private outputClaudeMessageAsStream(
+    claudeMessage: Message, 
+    controller: ReadableStreamDefaultController,
+    encoder: TextEncoder
+  ): void {
+    try {
+      // 发送 message_start 事件
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_start', {
+        type: 'message_start',
+        message: claudeMessage
+      })))
+
+      let contentIndex = 0
+
+      // 处理所有内容块
+      for (const contentBlock of claudeMessage.content) {
+        if (contentBlock.type === 'text') {
+          // 文本块
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_start', {
+            type: 'content_block_start',
+            index: contentIndex,
+            content_block: contentBlock
+          })))
+
+          // 发送完整文本
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index: contentIndex,
+            delta: { type: 'text_delta', text: contentBlock.text }
+          })))
+
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: contentIndex
+          })))
+
+        } else if (contentBlock.type === 'tool_use') {
+          // 工具使用块
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_start', {
+            type: 'content_block_start',
+            index: contentIndex,
+            content_block: contentBlock
+          })))
+
+          // 发送完整的工具参数（已修复）
+          const inputJson = JSON.stringify(contentBlock.input || {})
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index: contentIndex,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: inputJson
+            }
+          })))
+
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: contentIndex
+          })))
+        }
+
+        contentIndex++
+      }
+
+      // 发送消息完成
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_delta', {
+        type: 'message_delta',
+        delta: {
+          stop_reason: claudeMessage.stop_reason,
+          stop_sequence: claudeMessage.stop_sequence
+        }
+      })))
+
+      // 发送结束事件
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_stop', {
+        type: 'message_stop'
+      })))
+
+    } catch (error) {
+      console.error('输出Claude消息流时出错:', error)
+      throw error
+    }
+  }
+
+  /**
+   * 将chunks作为正常流式输出（无工具调用情况）
+   */
+  private outputChunksAsStream(
+    chunks: OpenAI.Chat.Completions.ChatCompletionChunk[],
+    controller: ReadableStreamDefaultController,
+    encoder: TextEncoder
+  ): void {
+    let messageStarted = false
+    let contentStarted = false
+    let contentIndex = 0
+
+    for (const chunk of chunks) {
+      // 发送 message_start 事件
+      if (!messageStarted) {
+        controller.enqueue(encoder.encode(this.createSSEEvent('message_start', {
+          type: 'message_start',
+          message: {
+            id: `msg_${Date.now()}`,
+            type: 'message',
+            role: 'assistant',
+            model: chunk.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 }
+          }
+        })))
+        messageStarted = true
+      }
+
+      const choice = chunk.choices[0]
+      if (!choice) continue
+
+      // 处理文本内容
+      if (choice.delta.content) {
+        // 如果是第一次收到内容，发送 content_block_start
+        if (!contentStarted) {
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_start', {
+            type: 'content_block_start',
+            index: contentIndex,
+            content_block: { type: 'text', text: '' }
+          })))
+          contentStarted = true
+        }
+
+        // 发送内容增量
+        controller.enqueue(encoder.encode(this.createSSEEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: contentIndex,
+          delta: { type: 'text_delta', text: choice.delta.content }
+        })))
+      }
+
+      // 处理完成
+      if (choice.finish_reason) {
+        if (contentStarted) {
+          controller.enqueue(encoder.encode(this.createSSEEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: contentIndex
+          })))
+        }
+
+        // 发送消息完成
+        controller.enqueue(encoder.encode(this.createSSEEvent('message_delta', {
+          type: 'message_delta',
+          delta: {
+            stop_reason: this.mapFinishReason(choice.finish_reason),
+            stop_sequence: null
+          }
+        })))
+
+        // 发送结束事件
+        controller.enqueue(encoder.encode(this.createSSEEvent('message_stop', {
+          type: 'message_stop'
+        })))
+      }
+    }
+  }
+
+  /**
+   * 处理流式错误
+   */
+  private handleStreamError(
+    error: any,
+    controller: ReadableStreamDefaultController,
+    encoder: TextEncoder
+  ): void {
+    try {
+      // 发送基本的错误恢复事件
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_start', {
+        type: 'message_start',
+        message: {
+          id: `msg_${Date.now()}`,
+          type: 'message',
+          role: 'assistant',
+          model: 'unknown',
+          content: [],
+          stop_reason: 'error',
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 }
+        }
+      })))
+      
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_delta', {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'error',
+          stop_sequence: null
+        }
+      })))
+      
+      controller.enqueue(encoder.encode(this.createSSEEvent('message_stop', {
+        type: 'message_stop'
+      })))
+    } catch (recoveryError) {
+      console.error('错误恢复也失败:', recoveryError)
+    }
+    
+    // 通知控制器错误
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    controller.error(new Error(`流式处理失败: ${errorMessage}`))
   }
 
   /**

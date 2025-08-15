@@ -118,6 +118,17 @@ describe('ClaudeToOpenAI缓存工具调用测试', () => {
         }
       }
       
+      // 模拟transformer的processRequest方法直接调用transformStreamResponse
+      // 创建模拟的OpenAI客户端响应
+      const mockStream = transformer as any
+      mockStream.client = {
+        chat: {
+          completions: {
+            create: () => mockOpenAIStream()
+          }
+        }
+      }
+      
       // 获取转换后的流
       const stream = await transformer.processRequest(claudeRequest, 'gpt-4')
       
